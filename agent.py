@@ -27,6 +27,50 @@ def _is_quota_error(exc: Exception) -> bool:
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "QUOTA" in msg
 
 
+def _is_not_found(exc: Exception) -> bool:
+    """Return True for 404 NOT_FOUND — model doesn't exist on this account."""
+    msg = str(exc).upper()
+    return "404" in msg or "NOT_FOUND" in msg
+
+
+def _discover_models(client: genai.Client) -> list[str]:
+    """
+    Query the live API for available generateContent models,
+    then return only the config models that actually exist.
+    Falls back to the full config list if the discovery call fails.
+    """
+    wanted = [config.GEMINI_MODEL] + config.FALLBACK_MODELS
+    try:
+        available = {
+            m.name.replace("models/", "")
+            for m in client.models.list()
+            if hasattr(m, "name")
+        }
+        validated = [m for m in wanted if m in available]
+        skipped   = [m for m in wanted if m not in available]
+
+        if skipped:
+            console.print(
+                f"[dim]  ℹ  Skipping unavailable models: {', '.join(skipped)}[/dim]"
+            )
+        if not validated:
+            console.print(
+                "[yellow]  ⚠  None of the configured models found — using config list as-is[/yellow]"
+            )
+            return wanted
+
+        console.print(
+            f"[dim]  ✓  Available models: {', '.join(validated)}[/dim]"
+        )
+        return validated
+
+    except Exception as e:
+        console.print(
+            f"[dim]  ⚠  Model discovery failed ({e}) — using config list[/dim]"
+        )
+        return wanted
+
+
 def _parse_retry_delay(exc: Exception) -> int | None:
     """
     Gemini embeds the suggested wait in the error body, e.g.:
@@ -58,16 +102,21 @@ def _generate_with_retry(
     gen_cfg: types.GenerateContentConfig,
     prompt: str,
     stream: bool = True,
+    _validated_models: list[str] | None = None,
 ) -> str:
     """
-    Walk each model in the fallback chain.
+    Walk each model in the validated fallback chain.
     Per model: up to RETRY_MAX_ATTEMPTS tries with smart wait.
 
     Wait priority (highest wins):
       1. retryDelay from API error body  ← exact value the server requests
       2. Exponential backoff             ← fallback when API gives no hint
+
+    404 NOT_FOUND → skip model immediately (don't retry, it won't appear).
+    429 RESOURCE_EXHAUSTED → retry with backoff, then move to next model.
+    Any other error → raise immediately.
     """
-    models_to_try = [config.GEMINI_MODEL] + config.FALLBACK_MODELS
+    models_to_try = _validated_models or (_discover_models(client))
 
     for model in models_to_try:
         backoff = config.RETRY_BASE_DELAY   # grows: 30 → 60 → 120 → 120
@@ -77,12 +126,19 @@ def _generate_with_retry(
                 return _call_model(client, gen_cfg, model, prompt, stream)
 
             except Exception as exc:
+                # 404 — model doesn't exist on this key/version, skip instantly
+                if _is_not_found(exc):
+                    console.print(
+                        f"[yellow]  ⚠  {model} not found on this account — skipping[/yellow]"
+                    )
+                    break   # move to next model, no point retrying
+
                 if not _is_quota_error(exc):
-                    raise               # non-quota errors surface immediately
+                    raise   # unexpected error — surface immediately
 
                 if attempt == config.RETRY_MAX_ATTEMPTS:
                     console.print(
-                        f"\n[yellow]⚠  {model} exhausted after "
+                        f"\n[yellow]⚠  {model} quota exhausted after "
                         f"{attempt} attempts — switching model…[/yellow]"
                     )
                     break
@@ -90,8 +146,8 @@ def _generate_with_retry(
                 # Prefer the API's own suggested delay; fall back to backoff
                 api_delay = _parse_retry_delay(exc)
                 wait      = api_delay if api_delay else min(backoff, config.RETRY_MAX_DELAY)
+                source    = f"API says {api_delay}s" if api_delay else f"backoff {wait}s"
 
-                source = f"API says {api_delay}s" if api_delay else f"backoff {wait}s"
                 console.print(
                     f"\n[yellow]⚠  429 on [bold]{model}[/bold] "
                     f"(attempt {attempt}/{config.RETRY_MAX_ATTEMPTS}) — "
@@ -188,10 +244,16 @@ class SyllabusAgent:
             max_output_tokens=config.MAX_OUTPUT_TOKENS,
             system_instruction=config.SYSTEM_INSTRUCTION,
         )
+        # Validate models against the live API once — avoids 404s mid-generation
+        console.print("[dim]Checking available Gemini models…[/dim]")
+        self._models = _discover_models(self._client)
 
     # ── low-level generation ──────────────────────────────────────
     def _generate(self, prompt: str, stream: bool = True) -> str:
-        return _generate_with_retry(self._client, self._gen_cfg, prompt, stream)
+        return _generate_with_retry(
+            self._client, self._gen_cfg, prompt, stream,
+            _validated_models=self._models,
+        )
 
     # ── public: generate full syllabus ───────────────────────────
     def generate(self, course: CourseInput, output_dir: str = config.OUTPUT_DIR) -> dict[str, str]:

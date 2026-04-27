@@ -1,15 +1,15 @@
 import os
 
-# Primary model — gemini-1.5-flash-8b has the highest free-tier RPD (requests/day)
-# and a separate quota bucket from gemini-2.0-flash, so it survives when 2.0-flash is drained
-GEMINI_MODEL = "gemini-1.5-flash-8b"
+# Primary model — gemini-2.0-flash is the default free-tier model
+GEMINI_MODEL = "gemini-2.0-flash"
 
-# Fallback chain — walked in order when the current model returns 429
-# Each is a completely independent quota bucket on Google's side
+# Fallback chain — walked in order when the current model returns 429.
+# Each has an independent quota bucket. Models are validated at startup
+# against the live API, so invalid names are skipped automatically.
 FALLBACK_MODELS = [
-    "gemini-1.5-flash",     # separate bucket, 15 RPM free
-    "gemini-2.0-flash",     # original primary — try again after others
-    "gemini-1.5-pro",       # lowest RPM (2/min) but rarely exhausted
+    "gemini-2.0-flash-lite",   # lighter 2.0 variant, higher free RPM
+    "gemini-1.5-flash",        # stable 1.5, separate quota bucket
+    "gemini-1.5-pro",          # lowest RPM (2/min) but rarely exhausted
 ]
 
 # Halved from 8192 → cuts per-request token cost, reduces quota pressure
