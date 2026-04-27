@@ -2,6 +2,7 @@
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -9,13 +10,103 @@ import google.genai as genai
 from google.genai import types
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 import config
 import prompts
 from models import CourseInput
 
 console = Console()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Retry helper — exponential backoff + model fallback on 429
+# ─────────────────────────────────────────────────────────────────
+def _is_quota_error(exc: Exception) -> bool:
+    """Return True for any 429 / RESOURCE_EXHAUSTED error."""
+    msg = str(exc).upper()
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "QUOTA" in msg
+
+
+def _generate_with_retry(
+    client: genai.Client,
+    gen_cfg: types.GenerateContentConfig,
+    prompt: str,
+    stream: bool = True,
+) -> str:
+    """
+    Try the primary model with exponential backoff, then walk the
+    fallback chain.  Each model gets RETRY_MAX_ATTEMPTS tries before
+    we move to the next one.
+
+    Back-off schedule (base=10s):
+      attempt 1 → wait 10s
+      attempt 2 → wait 20s
+      attempt 3 → wait 40s
+      attempt 4 → wait 80s   (capped at RETRY_MAX_DELAY=120s)
+    """
+    models_to_try = [config.GEMINI_MODEL] + config.FALLBACK_MODELS
+
+    for model in models_to_try:
+        delay = config.RETRY_BASE_DELAY
+
+        for attempt in range(1, config.RETRY_MAX_ATTEMPTS + 1):
+            try:
+                return _call_model(client, gen_cfg, model, prompt, stream)
+
+            except Exception as exc:
+                if not _is_quota_error(exc):
+                    raise                          # non-quota errors bubble up immediately
+
+                if attempt == config.RETRY_MAX_ATTEMPTS:
+                    # Exhausted retries on this model — try next in chain
+                    console.print(
+                        f"\n[yellow]⚠  Quota exhausted on [bold]{model}[/bold] "
+                        f"after {attempt} attempts — trying next model…[/yellow]"
+                    )
+                    break
+
+                wait = min(delay, config.RETRY_MAX_DELAY)
+                console.print(
+                    f"\n[yellow]⚠  429 on [bold]{model}[/bold] "
+                    f"(attempt {attempt}/{config.RETRY_MAX_ATTEMPTS}) — "
+                    f"waiting {wait}s before retry…[/yellow]"
+                )
+                time.sleep(wait)
+                delay *= 2   # double for next attempt
+
+    raise RuntimeError(
+        "All Gemini models returned 429 RESOURCE_EXHAUSTED.\n"
+        "Options:\n"
+        "  1. Wait ~60 minutes for the free-tier quota to reset\n"
+        "  2. Add a paid billing account at console.cloud.google.com\n"
+        "  3. Use multiple API keys — set GEMINI_API_KEY_2, GEMINI_API_KEY_3 "
+        "and re-run with --regen <section> to continue from where you stopped"
+    )
+
+
+def _call_model(
+    client: genai.Client,
+    gen_cfg: types.GenerateContentConfig,
+    model: str,
+    prompt: str,
+    stream: bool,
+) -> str:
+    """Single call to one model — streaming or blocking."""
+    full = ""
+    if stream:
+        for chunk in client.models.generate_content_stream(
+            model=model, contents=prompt, config=gen_cfg
+        ):
+            if chunk.text:
+                console.print(chunk.text, end="", markup=False, highlight=False)
+                full += chunk.text
+        console.print()
+    else:
+        resp = client.models.generate_content(
+            model=model, contents=prompt, config=gen_cfg
+        )
+        full = resp.text or ""
+    return full
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -70,25 +161,7 @@ class SyllabusAgent:
 
     # ── low-level generation ──────────────────────────────────────
     def _generate(self, prompt: str, stream: bool = True) -> str:
-        full = ""
-        if stream:
-            for chunk in self._client.models.generate_content_stream(
-                model=config.GEMINI_MODEL,
-                contents=prompt,
-                config=self._gen_cfg,
-            ):
-                if chunk.text:
-                    console.print(chunk.text, end="", markup=False, highlight=False)
-                    full += chunk.text
-            console.print()
-        else:
-            resp = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=prompt,
-                config=self._gen_cfg,
-            )
-            full = resp.text or ""
-        return full
+        return _generate_with_retry(self._client, self._gen_cfg, prompt, stream)
 
     # ── public: generate full syllabus ───────────────────────────
     def generate(self, course: CourseInput, output_dir: str = config.OUTPUT_DIR) -> dict[str, str]:
@@ -96,7 +169,7 @@ class SyllabusAgent:
         sections: dict[str, str] = {}
         co_ctx = ""
 
-        for key, label in self.SECTIONS:
+        for idx, (key, label) in enumerate(self.SECTIONS):
             console.print(Panel(f"[bold cyan]{label}[/bold cyan]", expand=False))
 
             if key == "core":
@@ -113,12 +186,20 @@ class SyllabusAgent:
             text = self._generate(p)
             sections[key] = text
 
-            # Save section immediately so progress isn't lost
+            # Save immediately — if later sections 429-fail, nothing is lost
             _save_section(key, text, output_dir, course.course_title)
 
-            # Build context from core section for all subsequent prompts
+            # Build shared context once core section is done
             if key == "core":
                 co_ctx = _extract_co_unit_context(text)
+
+            # Polite pause between calls to stay under RPM limits
+            if idx < len(self.SECTIONS) - 1:
+                console.print(
+                    f"[dim]  ⏸  Waiting {config.INTER_SECTION_DELAY}s before next section "
+                    f"(rate-limit protection)…[/dim]"
+                )
+                time.sleep(config.INTER_SECTION_DELAY)
 
         return sections
 
