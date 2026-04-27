@@ -19,12 +19,38 @@ console = Console()
 
 
 # ─────────────────────────────────────────────────────────────────
-# Retry helper — exponential backoff + model fallback on 429
+# Retry helper — parse API retryDelay + exponential backoff + model fallback
 # ─────────────────────────────────────────────────────────────────
 def _is_quota_error(exc: Exception) -> bool:
     """Return True for any 429 / RESOURCE_EXHAUSTED error."""
     msg = str(exc).upper()
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "QUOTA" in msg
+
+
+def _parse_retry_delay(exc: Exception) -> int | None:
+    """
+    Gemini embeds the suggested wait in the error body, e.g.:
+      'retryDelay': '62s'   or   'retry_delay { seconds: 62 }'
+    Extract that value so we wait exactly what the API asks for
+    instead of guessing with exponential backoff.
+    Returns seconds as int, or None if not found.
+    """
+    text = str(exc)
+    # Format 1: retryDelay: '62s'
+    m = re.search(r"retryDelay['\"\s:]+(\d+)s", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    # Format 2: retry_delay { seconds: 62 }
+    m = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    # Format 3: plain number followed by 's' anywhere near 'retry'
+    m = re.search(r"retry.*?(\d+)\s*s\b", text, re.IGNORECASE)
+    if m:
+        val = int(m.group(1))
+        if 5 <= val <= 300:   # sanity range
+            return val
+    return None
 
 
 def _generate_with_retry(
@@ -34,20 +60,17 @@ def _generate_with_retry(
     stream: bool = True,
 ) -> str:
     """
-    Try the primary model with exponential backoff, then walk the
-    fallback chain.  Each model gets RETRY_MAX_ATTEMPTS tries before
-    we move to the next one.
+    Walk each model in the fallback chain.
+    Per model: up to RETRY_MAX_ATTEMPTS tries with smart wait.
 
-    Back-off schedule (base=10s):
-      attempt 1 → wait 10s
-      attempt 2 → wait 20s
-      attempt 3 → wait 40s
-      attempt 4 → wait 80s   (capped at RETRY_MAX_DELAY=120s)
+    Wait priority (highest wins):
+      1. retryDelay from API error body  ← exact value the server requests
+      2. Exponential backoff             ← fallback when API gives no hint
     """
     models_to_try = [config.GEMINI_MODEL] + config.FALLBACK_MODELS
 
     for model in models_to_try:
-        delay = config.RETRY_BASE_DELAY
+        backoff = config.RETRY_BASE_DELAY   # grows: 30 → 60 → 120 → 120
 
         for attempt in range(1, config.RETRY_MAX_ATTEMPTS + 1):
             try:
@@ -55,32 +78,39 @@ def _generate_with_retry(
 
             except Exception as exc:
                 if not _is_quota_error(exc):
-                    raise                          # non-quota errors bubble up immediately
+                    raise               # non-quota errors surface immediately
 
                 if attempt == config.RETRY_MAX_ATTEMPTS:
-                    # Exhausted retries on this model — try next in chain
                     console.print(
-                        f"\n[yellow]⚠  Quota exhausted on [bold]{model}[/bold] "
-                        f"after {attempt} attempts — trying next model…[/yellow]"
+                        f"\n[yellow]⚠  {model} exhausted after "
+                        f"{attempt} attempts — switching model…[/yellow]"
                     )
                     break
 
-                wait = min(delay, config.RETRY_MAX_DELAY)
+                # Prefer the API's own suggested delay; fall back to backoff
+                api_delay = _parse_retry_delay(exc)
+                wait      = api_delay if api_delay else min(backoff, config.RETRY_MAX_DELAY)
+
+                source = f"API says {api_delay}s" if api_delay else f"backoff {wait}s"
                 console.print(
                     f"\n[yellow]⚠  429 on [bold]{model}[/bold] "
                     f"(attempt {attempt}/{config.RETRY_MAX_ATTEMPTS}) — "
-                    f"waiting {wait}s before retry…[/yellow]"
+                    f"waiting [bold]{wait}s[/bold] ({source})…[/yellow]"
                 )
                 time.sleep(wait)
-                delay *= 2   # double for next attempt
+                backoff = min(backoff * 2, config.RETRY_MAX_DELAY)
 
     raise RuntimeError(
-        "All Gemini models returned 429 RESOURCE_EXHAUSTED.\n"
-        "Options:\n"
-        "  1. Wait ~60 minutes for the free-tier quota to reset\n"
-        "  2. Add a paid billing account at console.cloud.google.com\n"
-        "  3. Use multiple API keys — set GEMINI_API_KEY_2, GEMINI_API_KEY_3 "
-        "and re-run with --regen <section> to continue from where you stopped"
+        "\n[red]All Gemini models returned 429 RESOURCE_EXHAUSTED.[/red]\n\n"
+        "Your free-tier daily quota is fully drained. Next steps:\n\n"
+        "  Option 1 — Wait for quota reset (resets at midnight Pacific time)\n"
+        "             Then re-run: python main.py --json sample_input.json --regen <section>\n"
+        "             Already-saved sections will NOT be regenerated.\n\n"
+        "  Option 2 — Add billing at console.cloud.google.com → quotas increase 10–100x\n\n"
+        "  Option 3 — Use a second free API key\n"
+        "             export GEMINI_API_KEY='your-second-key'\n"
+        "             python main.py --json sample_input.json --regen <next-section>\n\n"
+        "  Sections saved so far: check outputs/ folder."
     )
 
 
